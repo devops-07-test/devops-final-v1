@@ -1,87 +1,38 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
-# init_ca.sh – инициализация PKI и создание Root CA
-# Обработчик ошибок для вывода понятного сообщения
-trap 'echo "[FATAL] Ошибка в строке $LINENO. Скрипт завершен." >&2; exit 1' ERR
+LOG="/var/log/ca/sign_csr.log"
+CA_DIR="/etc/pki/pki"
 
-PKI_BASE="/etc/pki"
-PKI_DIR="$PKI_BASE/pki"
-VARS_FILE="$PKI_BASE/vars"
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG"; }
+error_exit() { log "ERROR: $1" >&2; exit 1; }
 
-# Проверка прав
-if [[ "$(id -u)" -ne 0 ]]; then
-  echo "[ERROR] Этот скрипт нужно запускать от root или через sudo." >&2
-  exit 1
-fi
+CSR_FILE="${1:?CSR файл обязателен}"
+TYPE="${2:?Тип: server или client}"
+OUT_CRT="${3:-${CSR_FILE%.csr}.crt}"
 
-# Более надежная проверка наличия easy-rsa
-if ! command -v easy-rsa &> /dev/null; then
-  echo "[ERROR] Команда easy-rsa не найдена. Сначала запусти install_ca.sh." >&2
-  exit 1
-fi
+[ "$EUID" -ne 0 ] && error_exit "Запуск от root"
+[ ! -f "$CSR_FILE" ] && error_exit "CSR не найден: $CSR_FILE"
+[ ! -f "$CA_DIR/private/ca.key" ] && error_exit "Root CA не инициализирован"
 
-mkdir -p "$PKI_BASE"
-cd "$PKI_BASE" || { echo "[ERROR] Не удалось перейти в $PKI_BASE" >&2; exit 1; }
+case "$TYPE" in server) EXT="server";; client) EXT="client";; *) error_exit "Тип: server или client";; esac
 
-# Улучшенная проверка идемпотентности: проверяем именно валидный CA
-if [[ -d "$PKI_DIR" ]]; then
-    if [[ -f "$PKI_DIR/ca.crt" ]]; then
-        echo "[INFO] PKI уже инициализирована, CA-сертификат найден: $PKI_DIR/ca.crt"
-        # Опционально: можно добавить быструю проверку валидности сертификата
-        if openssl x509 -in "$PKI_DIR/ca.crt" -noout &> /dev/null; then
-            echo "[INFO] Сертификат имеет корректный формат."
-        else
-            echo "[WARN] Файл ca.crt существует, но имеет неверный формат." >&2
-        fi
-        exit 0
-    else
-        echo "[WARN] Директория PKI существует, но ca.crt не найден. Будет создан заново." >&2
-        # По желанию: можно удалить старую директорию rm -rf "$PKI_DIR"
-    fi
-fi
+log "🚀 Подпись CSR БЕЗ пароля: $CSR_FILE -> $OUT_CRT ($TYPE)"
 
-echo "[INFO] Инициализирую PKI в $PKI_DIR ..."
-if ! easy-rsa init-pki; then
-    echo "[ERROR] Не удалось инициализировать PKI." >&2
-    exit 1
-fi
+cd /etc/pki
+expect -c "
+    spawn easy-rsa sign-req $EXT $CSR_FILE
+    expect {
+        \"Enter pass phrase\" { send \"\r\"; exp_continue }
+        \"Sign the certificate?\" { send \"yes\r\" }
+        eof
+    }
+"
 
-# vars – политика PKI
-if [[ ! -f "$VARS_FILE" ]]; then
-  echo "[INFO] Создаю файл vars..."
-  cat > "$VARS_FILE" << 'EOF'
-set_var EASYRSA_REQ_COUNTRY    "RU"
-set_var EASYRSA_REQ_PROVINCE   "Moscow"
-set_var EASYRSA_REQ_CITY       "Moscow"
-set_var EASYRSA_REQ_ORG        "DevOps-Final-Project"
-set_var EASYRSA_REQ_EMAIL      "admin@devops.local"
-set_var EASYRSA_REQ_OU         "Infrastructure"
+[ -f "$OUT_CRT" ] || error_exit "Сертификат не создан"
+cp "$OUT_CRT" /etc/pki/issued/
+chmod 644 /etc/pki/issued/"$(basename "$OUT_CRT")"
 
-set_var EASYRSA_ALGO           "ec"
-set_var EASYRSA_DIGEST         "sha512"
-
-set_var EASYRSA_CA_EXPIRE      3650
-set_var EASYRSA_CERT_EXPIRE    825
-EOF
-else
-  echo "[INFO] Файл vars уже существует, не перезаписываю."
-fi
-
-echo "[INFO] Создаю Root CA (build-ca)..."
-echo "[INFO] Введи пароль для ключа CA (минимум 4 символа) и CN: DevOps-Final-Root-CA"
-
-if ! easy-rsa build-ca; then
-    echo "[ERROR] Не удалось создать Root CA. Проверь ввод." >&2
-    exit 1
-fi
-
-echo "[SUCCESS] Root CA создан."
-echo "    Сертификат: $PKI_DIR/ca.crt"
-echo "    Ключ:       $PKI_DIR/private/ca.key"
-
-# Финальная проверка
-if [[ -f "$PKI_DIR/ca.crt" ]]; then
-    echo "[INFO] Проверка созданного сертификата:"
-    openssl x509 -in "$PKI_DIR/ca.crt" -subject -noout
-fi
+log "✅ Сертификат выдан: $OUT_CRT"
+log "Chain: cat $CA_DIR/ca.crt $OUT_CRT > chain.pem"
+exit 0

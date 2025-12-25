@@ -1,93 +1,38 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
-# sign_csr.sh – подпись server/client CSR на CA-сервере
+LOG="/var/log/ca/sign_csr.log"
+CA_DIR="/etc/pki/pki"
 
-PKI_BASE="/etc/pki"
-PKI_DIR="$PKI_BASE/pki"
-OUT_DIR="$PKI_BASE/out"
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG"; }
+error_exit() { log "ERROR: $1" >&2; exit 1; }
 
-usage() {
-  echo "Использование: $0 <server|client> <path-to-csr>"
-  exit 1
-}
+CSR_FILE="${1:?CSR файл обязателен}"
+TYPE="${2:?Тип: server или client}"
+OUT_CRT="${3:-${CSR_FILE%.csr}.crt}"
 
-# 1. Проверка аргументов
-if [[ $# -ne 2 ]]; then
-  usage
-fi
+[ "$EUID" -ne 0 ] && error_exit "Запуск от root"
+[ ! -f "$CSR_FILE" ] && error_exit "CSR не найден: $CSR_FILE"
+[ ! -f "$CA_DIR/private/ca.key" ] && error_exit "Root CA не инициализирован"
 
-TYPE="$1"
-CSR_PATH="$2"
+case "$TYPE" in server) EXT="server";; client) EXT="client";; *) error_exit "Тип: server или client";; esac
 
-if [[ "$TYPE" != "server" && "$TYPE" != "client" ]]; then
-  echo "[!] Первый аргумент должен быть 'server' или 'client'."
-  usage
-fi
+log "🚀 Подпись CSR БЕЗ пароля: $CSR_FILE -> $OUT_CRT ($TYPE)"
 
-if [[ ! -f "$CSR_PATH" ]]; then
-  echo "[!] CSR-файл не найден: $CSR_PATH"
-  exit 1
-fi
+cd /etc/pki
+expect -c "
+    spawn easy-rsa sign-req $EXT $CSR_FILE
+    expect {
+        \"Enter pass phrase\" { send \"\r\"; exp_continue }
+        \"Sign the certificate?\" { send \"yes\r\" }
+        eof
+    }
+"
 
-# 2. Проверка окружения
-if [[ "$(id -u)" -ne 0 ]]; then
-  echo "Этот скрипт нужно запускать от root или через sudo."
-  exit 1
-fi
+[ -f "$OUT_CRT" ] || error_exit "Сертификат не создан"
+cp "$OUT_CRT" /etc/pki/issued/
+chmod 644 /etc/pki/issued/"$(basename "$OUT_CRT")"
 
-if [[ ! -d "$PKI_DIR" || ! -f "$PKI_DIR/ca.crt" || ! -f "$PKI_DIR/private/ca.key" ]]; then
-  echo "[!] PKI не инициализирована или отсутствует CA. Сначала запусти init_ca.sh."
-  exit 1
-fi
-
-if [[ ! -x /usr/local/bin/easy-rsa ]]; then
-  echo "[!] Команда easy-rsa не найдена. Сначала запусти install_ca.sh."
-  exit 1
-fi
-
-mkdir -p "$OUT_DIR"
-
-# 3. Имя сертификата по имени файла CSR
-CSR_BASENAME="$(basename "$CSR_PATH")"
-NAME="${CSR_BASENAME%.*}"
-
-ISSUED_CRT="$PKI_DIR/issued/${NAME}.crt"
-
-if [[ -f "$ISSUED_CRT" ]]; then
-  echo "[!] Сертификат для имени '$NAME' уже существует: $ISSUED_CRT"
-  echo "    Удали или переименуй существующий сертификат, если нужно выдать новый."
-  exit 1
-fi
-
-echo "[*] Импортирую CSR '$CSR_PATH' как имя '$NAME'..."
-cd "$PKI_BASE"
-
-# Копируем CSR в pki/reqs для наглядности
-cp "$CSR_PATH" "$PKI_DIR/reqs/${NAME}.req"
-
-# 4. Подпись CSR
-echo "[*] Подписываю запрос как тип '$TYPE'..."
-echo "    Будет запрошен пароль ключа CA."
-
-easy-rsa import-req "$PKI_DIR/reqs/${NAME}.req" "$NAME"
-easy-rsa sign-req "$TYPE" "$NAME"
-
-# 5. Копирование результата в удобное место
-if [[ ! -f "$ISSUED_CRT" ]]; then
-  echo "[!] Ожидаемый сертификат не найден: $ISSUED_CRT"
-  exit 1
-fi
-
-TARGET_DIR="$OUT_DIR/$NAME"
-mkdir -p "$TARGET_DIR"
-
-cp "$ISSUED_CRT" "$TARGET_DIR/${NAME}.crt"
-cp "$PKI_DIR/ca.crt" "$TARGET_DIR/ca.crt"
-
-echo "[+] Сертификат успешно выдан."
-echo "    Тип:       $TYPE"
-echo "    Имя:       $NAME"
-echo "    CA CRT:    $PKI_DIR/ca.crt"
-echo "    Issued CRT:$ISSUED_CRT"
-echo "    Файлы для передачи лежат в: $TARGET_DIR"
+log "✅ Сертификат выдан: $OUT_CRT"
+log "Chain: cat $CA_DIR/ca.crt $OUT_CRT > chain.pem"
+exit 0
