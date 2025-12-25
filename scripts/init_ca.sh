@@ -1,38 +1,55 @@
 #!/bin/bash
 set -euo pipefail
 
-LOG="/var/log/ca/sign_csr.log"
+mkdir -p /var/log/ca
+LOG="/var/log/ca/init_ca.log"
 CA_DIR="/etc/pki/pki"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG"; }
-error_exit() { log "ERROR: $1" >&2; exit 1; }
+error_exit() { log "❌ ERROR: $1"; exit 1; }
 
-CSR_FILE="${1:?CSR файл обязателен}"
-TYPE="${2:?Тип: server или client}"
-OUT_CRT="${3:-${CSR_FILE%.csr}.crt}"
+# Идемпотентность
+if [ -f "$CA_DIR/ca.crt" ] && [ -f "$CA_DIR/private/ca.key" ]; then
+    log "✅ Root CA уже существует"
+    openssl x509 -in "$CA_DIR/ca.crt" -noout -dates | tee -a "$LOG"
+    exit 0
+fi
 
-[ "$EUID" -ne 0 ] && error_exit "Запуск от root"
-[ ! -f "$CSR_FILE" ] && error_exit "CSR не найден: $CSR_FILE"
-[ ! -f "$CA_DIR/private/ca.key" ] && error_exit "Root CA не инициализирован"
+log "🚀 Инициализация Root CA (БЕЗ пароля)..."
 
-case "$TYPE" in server) EXT="server";; client) EXT="client";; *) error_exit "Тип: server или client";; esac
+[ "$EUID" -ne 0 ] && error_exit "Требуется sudo/root"
+[ ! -d /etc/pki ] && error_exit "Сначала запустите install_ca.sh"
 
-log "🚀 Подпись CSR БЕЗ пароля: $CSR_FILE -> $OUT_CRT ($TYPE)"
+# Структура PKI
+mkdir -p "$CA_DIR"/{private,issued,certs,crls,newcerts}
+touch "$CA_DIR/index.txt"
+echo 1000 > "$CA_DIR/serial"
+chown -R root:root "$CA_DIR"
+chmod 700 "$CA_DIR/private"
+chmod 755 "$CA_DIR"
 
 cd /etc/pki
-expect -c "
-    spawn easy-rsa sign-req $EXT $CSR_FILE
-    expect {
-        \"Enter pass phrase\" { send \"\r\"; exp_continue }
-        \"Sign the certificate?\" { send \"yes\r\" }
-        eof
-    }
-"
 
-[ -f "$OUT_CRT" ] || error_exit "Сертификат не создан"
-cp "$OUT_CRT" /etc/pki/issued/
-chmod 644 /etc/pki/issued/"$(basename "$OUT_CRT")"
+# ✅ ФИКС: используем полный путь к easyrsa
+/usr/share/easy-rsa/easyrsa init-pki
 
-log "✅ Сертификат выдан: $OUT_CRT"
-log "Chain: cat $CA_DIR/ca.crt $OUT_CRT > chain.pem"
+cat > vars << 'EOF'
+export EASY_RSA="$(pwd)"
+export KEY_COUNTRY="RU"
+export KEY_PROVINCE="Moscow Oblast"
+export KEY_CITY="Khimki"
+export KEY_ORG="DevOpsCA"
+export KEY_EMAIL="admin@devops.local"
+export KEY_OU="CA"
+export KEY_NAME="RootCA"
+export KEY_ALTNAMES="DNS:ca.devops.local"
+EOF
+
+source vars
+/usr/share/easy-rsa/easyrsa build-ca nopass
+
+chmod 600 "$CA_DIR/private/ca.key"
+
+log "✅ Root CA создан!"
+openssl x509 -in "$CA_DIR/ca.crt" -noout -subject -dates | tee -a "$LOG"
 exit 0
